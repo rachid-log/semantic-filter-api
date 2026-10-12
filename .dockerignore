@@ -1,0 +1,57 @@
+# .env must never reach the build context — `COPY . .` would bake it into an
+# image layer where `docker history` can read it back out.
+.env
+.env.*
+!.env.example
+
+# Deploy credentials: VPS host, SSH key path, GitHub PAT. Read only by
+# scripts/deploy.sh and scripts/vps.sh on a developer machine. Nothing in the
+# image has any business seeing them.
+.env.deploy
+
+.git
+.github
+node_modules
+.next
+out
+dist
+build
+
+.claude
+.vscode
+.idea
+AGENTS.md
+CLAUDE.md
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.pem
+.vercel
+tsconfig.tsbuildinfo
+next-env.d.ts
+.DS_Store
+
+# Test output — artifacts of a run, never part of an image.
+/test-results/
+/playwright-report/
+/coverage/
+
+# Python — never part of the image; deps install from requirements.txt.
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+tests/
+requirements-dev.txt
+README.md
+
+# Docs, project card and social images — never part of the image.
+*.md
+LICENSE
+NOTICE
+media/
+.intropera/
+.intropera.json

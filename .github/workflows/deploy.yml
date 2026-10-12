@@ -1,0 +1,223 @@
+name: Deploy to VPS
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Two deploys racing each other would interleave `docker compose build` and the
+# container swap on the same server. Queue them instead.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Opt-in: the job is skipped (not failed) until you add the repository
+    # VARIABLE DEPLOY_ENABLED=true (Settings -> Secrets and variables -> Actions
+    # -> Variables). A fresh fork, or the public repo itself, has no server and
+    # no secrets, so without this gate every push to main would show a red deploy.
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Renders .env from the committed .env.example, replacing any KEY= whose
+      # name matches a repository secret. Keys with no matching secret keep the
+      # committed value — deliberate, so non-secret defaults ship unchanged.
+      - name: Generate .env file
+        id: generate-env
+        env:
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+          # Not a secret — comes from the workflow context. Ends up in the image
+          # so /api/health can prove which commit is running.
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          python3 -c "
+          import json, os, re
+
+          secrets = {}
+          if os.getenv('SECRETS_JSON'):
+              try:
+                  secrets = json.loads(os.getenv('SECRETS_JSON'))
+              except Exception as e:
+                  print(f'Error parsing secrets JSON: {e}')
+
+          with open('.env.example', 'r') as f:
+              lines = f.readlines()
+
+          out_lines = []
+          for line in lines:
+              match = re.match(r'^([A-Za-z0-9_]+)=(.*)$', line.strip())
+              if match:
+                  key, val = match.groups()
+                  new_val = os.getenv(key) or secrets.get(key)
+                  if new_val is not None:
+                      out_lines.append(f'{key}={new_val}\n')
+                  else:
+                      out_lines.append(line)
+              else:
+                  out_lines.append(line)
+
+          with open('.env', 'w') as f:
+              f.writelines(out_lines)
+          "
+
+      # The fallback-to-.env.example behaviour above is what makes this step
+      # necessary: without it a forgotten secret ships as a placeholder and the
+      # deploy goes green.
+      #
+      # Anchored to an assignment (`KEY=...__REQUIRED__`) rather than matching
+      # the string anywhere in the file. The unanchored form also matches the
+      # comments that *explain* the sentinel — including the ones in
+      # .env.example's own header — so it would fail every first deploy on the
+      # file's documentation instead of on a missing secret. A placeholder that
+      # survives the render is always a value, never a comment.
+      - name: Assert no placeholder secrets survived
+        run: |
+          if grep -nE '^[A-Za-z0-9_]+=.*__REQUIRED__' .env; then
+            echo "::error::The keys above are still placeholders. Add them as"
+            echo "::error::repository secrets (Settings -> Secrets and variables"
+            echo "::error::-> Actions -> Repository secrets), then re-run."
+            exit 1
+          fi
+          echo "no placeholders remain"
+
+      # CAVEAT: base64 defeats GitHub's automatic secret masking. Never add a
+      # step that echoes ENV_CONTENT, and keep the ssh-action's debug output off.
+      - name: Load .env content
+        id: read-env
+        run: |
+          echo "ENV_CONTENT=$(base64 -w 0 .env)" >> $GITHUB_OUTPUT
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HOST_IP_ADDRESS }}
+          username: ${{ secrets.HOST_ROOT_NAME }}
+          key: ${{ secrets.HOST_SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            # Abort on the first failing command instead of carrying on and
+            # swapping in something broken.
+            set -e
+
+            APP_DIR="$HOME/semantic-filter-api"
+            # github.repository is this repo (or your fork), so nothing to edit.
+            # A private repo needs GH_PAT to fetch; a public one needs nothing.
+            PUBLIC_URL="https://github.com/${{ github.repository }}.git"
+            GH_PAT="${{ secrets.GH_PAT }}"
+            if [ -n "$GH_PAT" ]; then
+              REPO_URL="https://x-access-token:${GH_PAT}@github.com/${{ github.repository }}.git"
+            else
+              REPO_URL="$PUBLIC_URL"
+            fi
+
+            # Sync in place instead of re-cloning. Faster, far less disk churn,
+            # and it leaves the Docker build context where it was so unchanged
+            # layers stay cached.
+            if [ -d "$APP_DIR/.git" ]; then
+              cd "$APP_DIR"
+              git fetch --depth 1 "$REPO_URL" main
+              git reset --hard FETCH_HEAD
+              # -fd, not -fdx: drops stray tracked-tree files but leaves
+              # gitignored ones like .env alone.
+              git clean -fd
+            else
+              rm -rf "$APP_DIR"
+              git clone --depth 1 "$REPO_URL" "$APP_DIR"
+              cd "$APP_DIR"
+              # Keep any token out of .git/config — fetches above pass it inline.
+              git remote set-url origin "$PUBLIC_URL"
+            fi
+
+            echo "${{ steps.read-env.outputs.ENV_CONTENT }}" | base64 --decode > .env
+            chmod 600 .env
+
+            # Keep the currently-deployed image so a bad release can be rolled
+            # back. Fails harmlessly on the very first deploy.
+            docker image tag semantic-filter-api:latest semantic-filter-api:previous || true
+
+            # Build while the old container is still up and serving traffic.
+            # `set -e` stops here if the build fails, so a build error is a
+            # red pipeline rather than a downed service.
+            docker compose build
+
+            # Only swap once the new image actually exists.
+            docker compose up -d --force-recreate semantic-filter-api
+
+            # ---- artifact guard -------------------------------------------
+            # Build-time values are baked into the image, so a container running
+            # a stale build passes every other check — healthy status, 200s, a
+            # valid certificate — while quietly serving the wrong domain or the
+            # wrong model.
+            #
+            # Two surfaces, because they fail differently:
+            #   a baked file -> what was compiled in at build time
+            #   /api/health  -> what the running process reads at runtime
+            # A mismatch between those two is itself a bug worth catching.
+            BAKED_PATH="/robots.txt"
+
+            EXPECTED_URL=$(grep '^SITE_URL=' .env | cut -d= -f2-)
+            EXPECTED_SHA=$(git rev-parse HEAD | cut -c1-12)
+
+            HEALTH=""
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              HEALTH=$(docker exec semantic-filter-api wget -qO- http://127.0.0.1:8080/api/health 2>/dev/null || true)
+              if [ -n "$HEALTH" ]; then break; fi
+              sleep 3
+            done
+
+            if [ -z "$HEALTH" ]; then
+              # wget discards the body on any non-2xx — so "the process never
+              # started" and "the process answered an error" look identical
+              # from here. The logs below tell them apart; read them before
+              # assuming a crash.
+              echo "NO HEALTH RESPONSE — the container failed to start, or answered non-2xx"
+              docker compose logs --tail=80 semantic-filter-api
+              exit 1
+            fi
+
+            field() { echo "$HEALTH" | grep -o "\"$1\":\"\?[^,\"}]*" | cut -d: -f2- | tr -d '"'; }
+
+            SERVED_URL=$(field siteUrl)
+            SERVED_SHA=$(field commit)
+
+            FAIL=0
+            [ "$SERVED_URL" = "$EXPECTED_URL" ] || { echo "RUNTIME DOMAIN MISMATCH — health says '$SERVED_URL', expected '$EXPECTED_URL'"; FAIL=1; }
+            [ "$SERVED_SHA" = "$EXPECTED_SHA" ] || { echo "COMMIT MISMATCH — health says '$SERVED_SHA', deploying '$EXPECTED_SHA'"; FAIL=1; }
+
+            if [ -n "$BAKED_PATH" ]; then
+              SERVED_BAKED=$(docker exec semantic-filter-api wget -qO- "http://127.0.0.1:8080$BAKED_PATH" 2>/dev/null | awk '/^Host:/{print $2}' || true)
+              [ "$SERVED_BAKED" = "$EXPECTED_URL" ] || { echo "BAKED DOMAIN MISMATCH — $BAKED_PATH says '$SERVED_BAKED', built for '$EXPECTED_URL'"; FAIL=1; }
+            fi
+
+            # Runtime-only secrets cannot be validated at build time, so this is
+            # the only place a missing one is caught — instead of surfacing later
+            # as every dedupe call failing 503. Health reports presence
+            # ("configured"/"missing"), never the value.
+            SERVED_AUTH=$(field auth)
+            [ "$SERVED_AUTH" = "configured" ] || { echo "EMBED_API_TOKEN MISSING — /embed would refuse every request"; FAIL=1; }
+
+            # The model the running container actually loaded must be the one
+            # the .env asked to be baked in — a stale image serves the wrong
+            # model with valid 200s, and mixed-model vectors corrupt dedupe.
+            EXPECTED_MODEL=$(grep '^EMBED_MODEL=' .env | cut -d= -f2-)
+            SERVED_MODEL=$(field model)
+            [ "$SERVED_MODEL" = "$EXPECTED_MODEL" ] || { echo "MODEL MISMATCH — health says '$SERVED_MODEL', expected '$EXPECTED_MODEL'"; FAIL=1; }
+
+            if [ "$FAIL" -ne 0 ]; then
+              echo "The container is running a stale or misconfigured image. Roll back with:"
+              echo "  cd $APP_DIR && docker image tag semantic-filter-api:previous semantic-filter-api:latest && docker compose up -d --force-recreate semantic-filter-api"
+              exit 1
+            fi
+            echo "verified: $SERVED_SHA on $SERVED_URL"
+
+            # Dangling layers only. `docker system prune -a -f` would delete
+            # semantic-filter-api:previous along with the layer cache — for every
+            # stack on the server — taking the rollback with it.
+            docker image prune -f
+
+            echo "Deployment completed successfully!"

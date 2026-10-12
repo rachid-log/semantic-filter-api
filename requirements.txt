@@ -1,0 +1,5 @@
+# Runtime dependencies. fastembed runs the model on ONNX Runtime — no torch,
+# which is what keeps the image and the RSS small enough for the 2GB box.
+fastapi~=0.115
+uvicorn[standard]~=0.34
+fastembed~=0.6

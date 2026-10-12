@@ -1,0 +1,24 @@
+# Runtime config and VPS deploy credentials. Only the *.example
+# schemas are committed — never a real secret.
+.env
+.env*
+!.env.example
+!.env.deploy.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.fastembed-cache/
+
+# Made at image build time (robots.txt), and local output
+static/
+out/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

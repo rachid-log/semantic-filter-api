@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "title": {
+    "en": "Semantic Filter API",
+    "fr": "Semantic Filter API"
+  },
+  "text": {
+    "en": "A self-hosted API that turns keywords into vectors, so n8n can skip near-duplicates like “seo tools” and “best seo tools” before a paid run. CPU only, no per-call cost.",
+    "fr": "Une API auto-hébergée qui transforme des mots-clés en vecteurs : n8n écarte les quasi-doublons (« seo tools », « best seo tools ») avant un run payant. CPU seul, sans coût par appel."
+  },
+  "context": {
+    "en": "Project by Rachid Ait Mohand, October 2026",
+    "fr": "Projet de Rachid Ait Mohand, octobre 2026"
+  },
+  "tech": [
+    "Python",
+    "FastAPI",
+    "fastembed",
+    "ONNX Runtime",
+    "Docker",
+    "Traefik"
+  ],
+  "image": {
+    "path": ".intropera/cover.png",
+    "alt": {
+      "en": "Semantic Filter API: “seo tools” and “best seo tools” score 0.954 as vectors, so the paid run is skipped.",
+      "fr": "Semantic Filter API : en vecteurs, « seo tools » et « best seo tools » ont 0,954, donc le run payant est évité."
+    },
+    "crop": "center"
+  }
+}

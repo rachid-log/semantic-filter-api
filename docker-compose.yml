@@ -1,0 +1,69 @@
+# One stack behind an existing Traefik: Traefik terminates TLS on `websecure`
+# and routes by Host into a shared external network (`root_default` here).
+# Nothing is published to the host — Traefik owns :80 and :443.
+#
+# Before the first deploy, change these to match your server:
+#   - the hostname in the Host(...) rule below (and SITE_URL in .env.example)
+#   - `root_default` and `mytlschallenge`, if your Traefik uses other names
+#     for its Docker network and its certificate resolver
+#
+# Compose reads ./.env twice here, for two different reasons:
+#   - ${...} interpolation below, which feeds the build args
+#   - env_file, which puts the same values in the running container
+# Both are needed, and they are not interchangeable. Build args are what gets
+# baked into the image (robots.txt, the model cache); env_file is what the
+# running process reads (the API token).
+#
+# `docker compose up` does not work without Traefik's external network. Locally
+# use:
+#   docker compose build && docker run --rm -p 8080:8080 --env-file .env semantic-filter-api:latest
+
+services:
+  semantic-filter-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # `:?` fails the build with a readable message instead of silently
+        # interpolating an empty string into the baked robots.txt Host: line.
+        SITE_URL: ${SITE_URL:?SITE_URL missing from .env}
+        # Which embedding model gets baked into the image. Changing it is a
+        # rebuild, not a restart — the model download happens at build time.
+        EMBED_MODEL: ${EMBED_MODEL:-BAAI/bge-small-en-v1.5}
+        GIT_SHA: ${GIT_SHA:-}
+        # EMBED_API_TOKEN is deliberately NOT here — it is a secret, and build
+        # args are readable via `docker history`. It reaches the container
+        # through env_file only.
+    image: semantic-filter-api:latest
+    container_name: semantic-filter-api
+    env_file:
+      - .env
+    restart: unless-stopped
+    labels:
+      # The router name is global to the Traefik instance and the container name
+      # is global to the Docker daemon — both must be unique on the whole server.
+      - "traefik.enable=true"
+      - "traefik.http.routers.semantic-filter-api.rule=Host(`embed.example.com`)"
+      # websecure only: this setup assumes Traefik already redirects port 80 to
+      # HTTPS for every host, in its own config. If yours does not, add that
+      # redirect there (or a `web` router with a redirect middleware here).
+      - "traefik.http.routers.semantic-filter-api.entrypoints=websecure"
+      - "traefik.http.routers.semantic-filter-api.tls.certresolver=mytlschallenge"
+      - "traefik.http.services.semantic-filter-api.loadbalancer.server.port=8080"
+      # Required because this container is on two networks — without it Traefik
+      # may pick the private one and every request times out.
+      - "traefik.docker.network=root_default"
+    networks:
+      - default
+      - root_default
+    logging:
+      # The disk is shared with every other app on the server. An unrotated
+      # container log is a server-wide outage with a confusing cause.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  root_default:
+    external: true
